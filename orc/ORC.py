@@ -3,16 +3,16 @@
 """
 Methods for ORC (Off-Resonance Correction)
 """
-import numpy.fft as npfft
-import numpy as np
-import pynufft
-import matplotlib.pyplot as plt
-from math import ceil, sqrt
-
-
+from concurrent.futures import as_completed, ThreadPoolExecutor
+from math import ceil
 from math import pi
 
-def add_or(M, kt, df, nonCart = None, params = None):
+import numpy as np
+import numpy.fft as npfft
+import pynufft
+
+
+def add_or(M, kt, df, nonCart=None, params=None):
     '''Adds off-resonance
 
     Parameters
@@ -49,14 +49,19 @@ def add_or(M, kt, df, nonCart = None, params = None):
 
     for x in range(M.shape[0]):
         for y in range(M.shape[1]):
-            phi = 2*pi*df[x,y]*kt
-            kspace_orc = kspace*np.exp(-1j*phi)
+            phi = 2 * pi * df[x, y] * kt
+            kspace_orc = kspace * np.exp(-1j * phi)
             M_corr = ksp2im(kspace_orc, cartesian_opt, NufftObj, params)
-            M_or[x,y] = M_corr[x,y]
+            M_or[x, y] = M_corr[x, y]
 
     return M_or
 
-def add_or_CPR(M, kt, df, nonCart = None, params = None):
+
+def _threaded_ksp2im(_kspace_or, _cartesian_opt, _NufftObj, _params):
+    return ksp2im(_kspace_or, _cartesian_opt, _NufftObj, _params)
+
+
+def add_or_CPR(M, kt, df, nonCart=None, params=None):
     '''Create a phase matrix - 2*pi*df*t for every df and every t'''
     if nonCart is not None:
         cartesian_opt = 0
@@ -70,15 +75,26 @@ def add_or_CPR(M, kt, df, nonCart = None, params = None):
     kspace = im2ksp(M, cartesian_opt, NufftObj, params)
 
     df_values = np.unique(df)
-    T = np.tile(params['t_vector'],(1, kt.shape[1]))
-    M_or_CPR = np.zeros((M.shape[0], M.shape[1], len(df_values)), dtype=complex)
-    kspsave= np.zeros((params['Npoints'],params['Nshots'],len(df_values)),dtype=complex)
-    for i in range(len(df_values)):
-        phi = - 2 * pi* df_values[i] * T
-        kspace_or= kspace * np.exp(1j * phi)
-        kspsave[:,:,i] = kspace_or
-        M_corr = ksp2im(kspace_or, cartesian_opt, NufftObj, params)
-        M_or_CPR[:, :, i] = M_corr
+    T = np.tile(params['t_vector'], (1, kt.shape[1]))
+
+    # Multi-threading to save precious seconds
+    with ThreadPoolExecutor() as executor:
+        M_or_CPR = []
+        kspsave = []
+        futures = []
+        for i in range(len(df_values)):
+            phi = - 2 * pi * df_values[i] * T
+            kspace_or = np.multiply(kspace, np.exp(1j * phi))
+            kspsave.append(kspace_or)
+            futures.append(executor.submit(_threaded_ksp2im, kspace_or, cartesian_opt, NufftObj, params))
+
+        for f in as_completed(futures):
+            M_or_CPR.append(f.result())
+
+        kspsave = np.stack(kspsave)
+        kspsave = np.moveaxis(kspsave, [0, 1, 2], [2, 0, 1])
+        M_or_CPR = np.stack(M_or_CPR)
+        M_or_CPR = np.moveaxis(M_or_CPR, [0, 1, 2], [2, 0, 1])
 
     M_or = np.zeros(M.shape, dtype=complex)
     for x in range(M.shape[0]):
@@ -89,6 +105,7 @@ def add_or_CPR(M, kt, df, nonCart = None, params = None):
     '''plt.imshow(abs(M_or))
     plt.show()'''
     return M_or, kspsave
+
 
 def orc(M, kt, df):
     '''Off-resonance correction for Cartesian trajectories
@@ -119,7 +136,8 @@ def orc(M, kt, df):
 
     return M_hat
 
-def CPR(kspace, kt, df, nonCart = None, params = None, M = None):
+
+def CPR(kspace, kt, df, nonCart=None, params=None, M=None):
     '''Off-resonance Correction by Conjugate Phase Reconstruction
 
     Parameters
@@ -149,29 +167,30 @@ def CPR(kspace, kt, df, nonCart = None, params = None, M = None):
         NufftObj = None
         params = None
 
-    if M  is not None:
+    if M is not None:
         kspace = im2ksp(M, cartesian_opt, NufftObj, params)
 
     T = np.tile(params['t_vector'], (1, kt.shape[1]))
     # kspace = fft.fftshift(fft.fft2(M))
-    #kspace = im2ksp(M,kt,cartesian_opt,NufftObj,params)
+    # kspace = im2ksp(M,kt,cartesian_opt,NufftObj,params)
     df_values = np.unique(df)
     M_CPR = np.zeros((params['N'], params['N'], len(df_values)), dtype=complex)
     for i in range(len(df_values)):
         phi = 2 * pi * df_values[i] * T
-        kspace_orc = kspace* np.exp(1j * phi)
+        kspace_orc = kspace * np.exp(1j * phi)
         M_corr = ksp2im(kspace_orc, cartesian_opt, NufftObj, params)
         M_CPR[:, :, i] = M_corr
 
-    M_hat = np.zeros((params['N'],params['N']), dtype=complex)
+    M_hat = np.zeros((params['N'], params['N']), dtype=complex)
     for x in range(df.shape[0]):
         for y in range(df.shape[1]):
-            fieldmap_val = df[x,y]
+            fieldmap_val = df[x, y]
             idx = np.where(df_values == fieldmap_val)
-            M_hat[x,y] = M_CPR[x,y,idx]
+            M_hat[x, y] = M_CPR[x, y, idx]
     '''plt.imshow(abs(M_hat))
     plt.show()'''
     return M_hat
+
 
 def fs_CPR(dataIn, dataInType, kt, df, Lx, params, rawData=None, M_fwd=None):
     '''Off-resonance Correction by frequency-segmented Conjugate Phase Reconstruction
@@ -207,49 +226,50 @@ def fs_CPR(dataIn, dataInType, kt, df, Lx, params, rawData=None, M_fwd=None):
             raise ValueError('Data dimensions do not agree with expected image dimensions')
         rawData = im2ksp(dataIn, cartesian_opt, NufftObj, params)
     elif dataInType == 'raw':
-        if dataIn.shape[0] != kt.shape[0] or  dataIn.shape[1] != kt.shape[1]:
+        if dataIn.shape[0] != kt.shape[0] or dataIn.shape[1] != kt.shape[1]:
             raise ValueError('Data dimensions do not agree with expected dimensions (same as ktraj)')
         rawData = dataIn
     else:
         raise ValueError('The type of input data should be either raw or im')
 
     # Number of frequency segments
-    df_max = max(np.abs([df.max(),df.min()])) # Hz
-    L = ceil(4*df_max*2*pi*params['t_readout']/pi)
-    L= L * Lx
-    f_L = np.linspace(df.min(),df.max(),L+1) # Hz
+    df_max = max(np.abs([df.max(), df.min()]))  # Hz
+    L = ceil(4 * df_max * 2 * pi * params['t_readout'] / pi)
+    L = L * Lx
+    f_L = np.linspace(df.min(), df.max(), L + 1)  # Hz
 
     T = np.tile(params['t_vector'], (1, kt.shape[1]))
 
     # reconstruct the L basic images
-    M_fsCPR = np.zeros((params['N'],params['N'],L+1),dtype=complex)
-    for l in range(L+1):
+    M_fsCPR = np.zeros((params['N'], params['N'], L + 1), dtype=complex)
+    for l in range(L + 1):
         phi = 2 * pi * f_L[l] * T
-        kspace_L = rawData * np.exp(1j*phi)
-        M_fsCPR[:,:,l] = ksp2im(kspace_L, cartesian_opt, NufftObj, params)
+        kspace_L = rawData * np.exp(1j * phi)
+        M_fsCPR[:, :, l] = ksp2im(kspace_L, cartesian_opt, NufftObj, params)
 
     # final image reconstruction
-    M_hat = np.zeros((params['N'],params['N']),dtype=complex)
+    M_hat = np.zeros((params['N'], params['N']), dtype=complex)
     for i in range(M_hat.shape[0]):
         for j in range(M_hat.shape[1]):
-            fieldmap_val = df[i,j]
+            fieldmap_val = df[i, j]
             closest_fL_idx = find_nearest(f_L, fieldmap_val)
 
             if fieldmap_val == f_L[closest_fL_idx]:
-                pixel_val = M_fsCPR[i,j,closest_fL_idx]
+                pixel_val = M_fsCPR[i, j, closest_fL_idx]
             else:
                 if fieldmap_val < f_L[closest_fL_idx]:
-                    f_vals = [f_L[closest_fL_idx-1], f_L[closest_fL_idx]]
-                    im_vals = [M_fsCPR[i,j,closest_fL_idx-1], M_fsCPR[i,j,closest_fL_idx]]
+                    f_vals = [f_L[closest_fL_idx - 1], f_L[closest_fL_idx]]
+                    im_vals = [M_fsCPR[i, j, closest_fL_idx - 1], M_fsCPR[i, j, closest_fL_idx]]
                 else:
-                    f_vals = [f_L[closest_fL_idx], f_L[closest_fL_idx+1]]
-                    im_vals = [M_fsCPR[i, j, closest_fL_idx], M_fsCPR[i, j, closest_fL_idx+1]]
+                    f_vals = [f_L[closest_fL_idx], f_L[closest_fL_idx + 1]]
+                    im_vals = [M_fsCPR[i, j, closest_fL_idx], M_fsCPR[i, j, closest_fL_idx + 1]]
 
                 pixel_val = np.interp(fieldmap_val, f_vals, im_vals)
 
-            M_hat[i,j] = pixel_val
+            M_hat[i, j] = pixel_val
 
     return M_hat
+
 
 def MFI(dataIn, dataInType, kt, df, Lx, params):
     '''Off-resonance Correction by Multi-Frequency Interpolation
@@ -292,13 +312,12 @@ def MFI(dataIn, dataInType, kt, df, Lx, params):
     else:
         raise ValueError('The type of input data should be either raw or im')
 
-
-    df = np.round(df,1)
+    df = np.round(df, 1)
     idx, idy = np.where(df == -0.0)
     df[idx, idy] = 0.0
 
     # Number of frequency segments
-    df_max = max(np.abs([df.max(),df.min()]))  # Hz
+    df_max = max(np.abs([df.max(), df.min()]))  # Hz
     df_range = (df.min(), df.max())
     L = ceil(df_max * 2 * pi * params['t_readout'] / pi)
     L = L * Lx
@@ -307,7 +326,7 @@ def MFI(dataIn, dataInType, kt, df, Lx, params):
     T = np.tile(params['t_vector'], (1, kt.shape[1]))
 
     # reconstruct the L basic images
-    M_MFI = np.zeros((params['N'],params['N'], L + 1), dtype=complex)
+    M_MFI = np.zeros((params['N'], params['N'], L + 1), dtype=complex)
     for l in range(L + 1):
         phi = 2 * pi * f_L[l] * T
         kspace_L = rawData * np.exp(1j * phi)
@@ -320,12 +339,11 @@ def MFI(dataIn, dataInType, kt, df, Lx, params):
     M_hat = np.zeros((params['N'], params['N']), dtype=complex)
     for i in range(M_hat.shape[0]):
         for j in range(M_hat.shape[1]):
-            fieldmap_val = df[i,j]
+            fieldmap_val = df[i, j]
             val_coeffs = coeffs_LUT[str(fieldmap_val)]
-            M_hat[i,j] = sum(val_coeffs*M_MFI[i,j,:])
+            M_hat[i, j] = sum(val_coeffs * M_MFI[i, j, :])
 
     return M_hat
-
 
 
 def im2ksp(M, cartesian_opt, NufftObj=None, params=None):
@@ -362,6 +380,7 @@ def im2ksp(M, cartesian_opt, NufftObj=None, params=None):
         raise ValueError('Cartesian option should be either 0 or 1')
     return kspace
 
+
 def ksp2im(ksp, cartesian_opt, NufftObj=None, params=None):
     '''K-space to image transformation
 
@@ -385,16 +404,17 @@ def ksp2im(ksp, cartesian_opt, NufftObj=None, params=None):
         im = npfft.ifft2(ksp)
     elif cartesian_opt == 0:
         if 'dcf' in params:
-            ksp_dcf = ksp.reshape((params['Npoints']*params['Nshots'],))*params['dcf']
+            ksp_dcf = ksp.reshape((params['Npoints'] * params['Nshots'],)) * params['dcf']
         else:
             ksp_dcf = ksp.reshape((params['Npoints'] * params['Nshots'],))
-        im = NufftObj.adjoint(ksp_dcf) #* np.prod(sqrt(4 * params['N'] ** 2))
+        im = NufftObj.adjoint(ksp_dcf)  # * np.prod(sqrt(4 * params['N'] ** 2))
 
-        #im = NufftObj.solve(ksp_dcf, solver='cg', maxiter=50)
+        # im = NufftObj.solve(ksp_dcf, solver='cg', maxiter=50)
     else:
         raise ValueError('Cartesian option should be either 0 or 1')
 
     return im
+
 
 def nufft_init(kt, params):
     '''Initializes the Non-uniform FFT object
@@ -424,7 +444,8 @@ def nufft_init(kt, params):
     NufftObj.plan(om, Nd, Kd, Jd)
     return NufftObj
 
-def find_nearest(array,value):
+
+def find_nearest(array, value):
     '''Finds the index of the value's closest array element
 
     Parameters
@@ -448,7 +469,8 @@ def find_nearest(array,value):
 
     return idx
 
-def coeffs_MFI_lsq(kt, f_L, df_range,params):
+
+def coeffs_MFI_lsq(kt, f_L, df_range, params):
     '''Finds the coefficients for Multi-frequency interpolation method by least squares approximation.
 
     Parameters
@@ -467,21 +489,21 @@ def coeffs_MFI_lsq(kt, f_L, df_range,params):
     cL : dict
         Coefficients look-up-table.
     '''
-    fs = 0.1 # Hz
-    f_sampling = np.round(np.arange(df_range[0], df_range[1]+fs, fs),1)
+    fs = 0.1  # Hz
+    f_sampling = np.round(np.arange(df_range[0], df_range[1] + fs, fs), 1)
 
-    alpha = 1.2 #
-    t_limit = params['t_vector'][-1] # TE + Tacq
-    T = np.linspace(0, alpha * t_limit, params['Npoints']).reshape(-1, )# specific to siemens, might have to change it
+    alpha = 1.2  #
+    t_limit = params['t_vector'][-1]  # TE + Tacq
+    T = np.linspace(0, alpha * t_limit, params['Npoints']).reshape(-1, )  # specific to siemens, might have to change it
     # T = params['t_vector'][:,0]
     A = np.zeros((kt.shape[0], f_L.shape[0]), dtype=complex)
     for l in range(f_L.shape[0]):
-        phi = 2*pi*f_L[l]*T
-        A[:, l] = np.exp(1j *phi)
+        phi = 2 * pi * f_L[l] * T
+        A[:, l] = np.exp(1j * phi)
 
-    cL={}
+    cL = {}
     for fs in f_sampling:
-        b = np.exp(1j* 2*pi*fs*T)
+        b = np.exp(1j * 2 * pi * fs * T)
         C = np.linalg.lstsq(A, b, rcond=None)
         if fs == -0.0:
             fs = 0.0
@@ -489,12 +511,13 @@ def coeffs_MFI_lsq(kt, f_L, df_range,params):
 
     return cL
 
-def polynomial_fit(df,M):
+
+def polynomial_fit(df, M):
     ''' Deprecated '''
     S = 0
     S_x = 0
     S_y = 0
-    S_f =0
+    S_f = 0
     S_xx = 0
     S_yy = 0
     S_xy = 0
@@ -502,16 +525,16 @@ def polynomial_fit(df,M):
     S_yf = 0
     for xi in range(M.shape[0]):
         for yi in range(M.shape[1]):
-            omega = 1/np.abs(M[xi, yi])
-            S = 1/omega**2
-            S_x = xi/omega**2
-            S_y = yi/omega**2
-            S_f = df[xi,yi]/omega**2
-            S_xx = xi**2/omega**2
+            omega = 1 / np.abs(M[xi, yi])
+            S = 1 / omega ** 2
+            S_x = xi / omega ** 2
+            S_y = yi / omega ** 2
+            S_f = df[xi, yi] / omega ** 2
+            S_xx = xi ** 2 / omega ** 2
             S_yy = yi ** 2 / omega ** 2
-            S_xy = xi*yi/omega**2
-            S_xf = xi * df[xi,yi] / omega ** 2
-            S_yf = yi*df[xi,yi] / omega ** 2
+            S_xy = xi * yi / omega ** 2
+            S_xf = xi * df[xi, yi] / omega ** 2
+            S_yf = yi * df[xi, yi] / omega ** 2
 
         S += S
         S_x += S_x
@@ -523,20 +546,18 @@ def polynomial_fit(df,M):
         S_xf += S_xf
         S_yf += S_yf
 
-    delta = np.asarray(([S, S_x, S_y], [S_x, S_xx, S_xy],[S_y, S_xy, S_yy]))
-    delta_f = np.asarray(([S_f, S_x, S_y],[S_xf, S_xx, S_xy], [S_yf, S_xy, S_yy]))
-    delta_x = np.linalg.det(np.asarray(([S, S_f, S_y],[S_x, S_xf, S_xy], [S_y, S_yf, S_yy])))
+    delta = np.asarray(([S, S_x, S_y], [S_x, S_xx, S_xy], [S_y, S_xy, S_yy]))
+    delta_f = np.asarray(([S_f, S_x, S_y], [S_xf, S_xx, S_xy], [S_yf, S_xy, S_yy]))
+    delta_x = np.linalg.det(np.asarray(([S, S_f, S_y], [S_x, S_xf, S_xy], [S_y, S_yf, S_yy])))
     delta_y = np.linalg.det(np.asarray(([S, S_x, S_f], [S_x, S_xx, S_xf], [S_y, S_xy, S_yf])))
 
-
-    f_0 = delta_f/delta
-    alpha = delta_x/delta
-    beta = delta_y/delta
+    f_0 = delta_f / delta
+    alpha = delta_x / delta
+    beta = delta_y / delta
 
     lin_df = np.zeros(df.shape)
     for xi in range(df.shape[0]):
         for yi in range(df.shape[1]):
-            lin_df[xi,yi] = f_0+alpha*xi+beta*yi
-
+            lin_df[xi, yi] = f_0 + alpha * xi + beta * yi
 
     return lin_df
