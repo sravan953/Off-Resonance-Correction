@@ -1,6 +1,6 @@
 '''
 Author: Marina Manso Jimeno
-Last modified: 03/02/2020
+Last modified: 04/24/2020 by Keerthi Sravan Ravi
 '''
 
 import scipy.io as sio
@@ -8,10 +8,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 
-from rawdata_recon import b0map_recon
-from rawdata_recon import spiral_recon
+from orc.rawdata_recon import b0map_recon
+from orc.rawdata_recon import spiral_recon
 
-import ORC
+import orc.ORC as ORC
 
 ##
 # Load the input data (raw data, k-space trajectory and field map
